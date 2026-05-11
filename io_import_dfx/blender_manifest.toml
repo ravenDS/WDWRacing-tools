@@ -1,0 +1,21 @@
+schema_version = "1.0.0"
+
+id = "io_import_dfx"
+version = "2.2.0"
+name = "Walt Disney World Quest DFX/DRM Importer"
+tagline = "Import Walt Disney Magical Racing Tour DFX/DRM levels"
+maintainer = "ravenDS"
+type = "add-on"
+
+website = "https://github.com/RavenDS/WDWRacing-tools"
+
+tags = ["Import-Export"]
+
+blender_version_min = "4.2.0"
+
+license = [
+    "SPDX:GPL-3.0-or-later",
+]
+copyright = [
+    "2026 ravenDS",
+]
