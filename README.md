@@ -1,6 +1,8 @@
 # WDWRacing-tools
 A collection of tools & Blender plugins for **Walt Disney World Quest: Magical Racing Tour** (PC/PS1)
 
+![Imported level in Blender](WDWRtools.png)
+
 ### Currently supports: 
 - Import of WDWR PC (**.DFX**) & PS1 (**.DRM**) level files
 - Textures extraction from associated files (**.VD3** & **.VRM**)
