@@ -12,9 +12,8 @@ A collection of tools & Blender plugins for **Walt Disney World Quest: Magical R
 - Objects placement
 - AI paths & animation paths
 - Track overlay & checkpoint placement _(experimental)_
+- Animation data & animation paths cueing
 
 ### Work-in-progress: 
-- Animation data
-- Proper animation paths for specific objects
-- Track FX & overlay processing
+- Track FX, particle effects & overlay processing
 - Dreamcast format
