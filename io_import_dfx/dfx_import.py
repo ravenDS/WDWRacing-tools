@@ -49,14 +49,24 @@ class ExtractedModel:
 
 @dataclass
 class AnimChannel:
-    bone_index: int = 0; axis: int = 0; component_type: int = 0
-    component: str = 'R'  # 'R'=rotation, 'T'=translation, 'S'=scale
+    bone_index: int = 0
+    axis: int = 0            # 0=X 1=Y 2=Z
+    plane: int = 0           # 0=rotation 1=scale 2=translation
+    kind: str = ''           # record encoding: raw / const / nib / seg
     keyframes: List[float] = field(default_factory=list)
 
 @dataclass
 class ParsedAnimation:
-    name: str = ""; frame_count: int = 0; w1: int = 0; ch: int = 0
-    is_raw: bool = False; channels: List[AnimChannel] = field(default_factory=list)
+    name: str = ""
+    channel_count: int = 0
+    key_count: int = 0
+    record_addr: int = 0
+    warnings: List[str] = field(default_factory=list)
+    channels: List[AnimChannel] = field(default_factory=list)
+
+    @property
+    def frame_count(self):
+        return self.key_count
 
 @dataclass
 class SplineSegment:
@@ -72,310 +82,254 @@ def ru32(data, offset): return struct.unpack_from('<I', data, offset)[0]
 def ri32(data, offset): return struct.unpack_from('<i', data, offset)[0]
 
 # =========================================================================
-#  Animation parsing (UNFINISHED and non-functional, removed from operator)
+#  Bone animation parsing
 # =========================================================================
+#
+# Animation record (16 bytes; the object header's +0x14 field points to a
+# table of pointers to these, terminated by a non-pointer value):
+#     +0  u16 channel_count
+#     +2  u16 key_count
+#     +4  u32 -> channel header (bit-mask)
+#     +8  u32 -> curve stream
+#     +12 u32 -> 8-char name
+#
+# Channel header:
+#     byte 0   plane flags: bit0 = rotation, bit1 = scale, bit2 = translation
+#     byte 1.. one bit-plane per set flag, in flag order.  Each plane holds
+#              3 bits per bone (bit index = bone*3 + axis, LSB first) and is
+#              ceil(anim_bone_count*3/8) bytes.  The animation's bone count
+#              may exceed the mesh's (shared kart rigs); the whole header is
+#              padded to an even length.
+#
+# Channels are ordered bone-major; inside each bone: rotation x,y,z,
+# translation x,y,z, scale x,y,z (only the flagged ones).  The curve stream
+# holds one self-delimiting record per channel, in that order.  With the
+# first u16 `w` of a record, mode = w >> 13:
+#     000 / 111  raw   : w itself is key 0 (i16), followed by key_count-1 i16
+#     001        const : 13-bit signed value in w, held for every key
+#     010        nib   : i16 initial value, then key_count-1 packed 4-bit
+#                        nibbles (low nibble first, sign-magnitude: bit 3 =
+#                        negative, bits 0-2 = magnitude), padded to 2 bytes.
+#                        IMA-ADPCM style: the low byte of w is the initial
+#                        step index; each nibble adds step/8 + mag*step/4
+#                        (step from ANIM_NIB_STEP, index adapted by
+#                        ANIM_NIB_INDEX) with the nibble's sign.
+#     011        seg   : low 13 bits of w = record length in u16 words
+#                        (including w).  i16 initial value, then words with
+#                        bits 0-4 = run length in keys and bits 5-15 = signed
+#                        delta spread linearly over that run; runs sum to
+#                        key_count-1.
+#
+# Units: rotation 4096 = 360 deg (per-axis Euler, X applied first, then Y,
+# then Z i.e. M = Rz*Ry*Rx), scale 1024 = 1.0, translation = absolute bone
+# position in parent space (same units as the bone rest offsets).
 
-_CH_TO_BPA = {1: 1, 5: 2, 7: 3}
+ANIM_PLANE_ROT, ANIM_PLANE_SCALE, ANIM_PLANE_TRANS = 0, 1, 2
+ANIM_PLANE_NAMES = {0: 'rot', 1: 'scale', 2: 'trans'}
+ANIM_ROT_UNIT = 4096.0
+ANIM_SCALE_UNIT = 1024.0
+ANIM_NIB_INDEX = [-1, -2, -1, -1, 1, 2, 4, 7, -1, -2, -1, -1, 1, 2, 4, 7]
+ANIM_NIB_STEP = [7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 22, 24, 26, 29, 32, 35, 38,
+                 41, 45, 49, 53, 57, 62, 67, 72, 79, 85, 91, 97, 104, 111, 118, 126,
+                 107, 115, 124, 133, 142, 152, 162, 173, 184, 196, 208, 221, 234, 248,
+                 262, 277, 293, 309, 326, 343, 361, 380, 400, 421, 443, 466, 491, 518,
+                 547, 579]
 
-def _gte_to_radians(gte_val):
-    """Convert a GTE fixed-point rotation value to radians.
-    GTE convention: 4096 = one full revolution (360°).
-    Value should already be phase-unwrapped before calling this."""
-    import math
-    return (gte_val / 4096.0) * 2.0 * math.pi
 
-def _unwrap_gte_channel(values):
-    """Phase-unwrap a channel of GTE rotation values.
-    The GTE engine wraps internally (mod 4096), so accumulated values like
-    16409 actually mean 25 (= 2.2°). We unwrap to keep values smooth
-    and in the correct range.
-    Returns new list of unwrapped values."""
+def _sign_extend(v, bits):
+    v &= (1 << bits) - 1
+    return v - (1 << bits) if v >> (bits - 1) else v
+
+
+def _anim_record_length(w, keys):
+    mode = w >> 13
+    if mode in (0, 7):
+        return 2 * keys, 'raw'
+    if mode == 1:
+        return 2, 'const'
+    if mode == 2:
+        n = 4 + (keys - 1 + 1) // 2
+        return n + (n & 1), 'nib'
+    if mode == 3:
+        return (w & 0x1FFF) * 2, 'seg'
+    return None, None
+
+
+def _anim_decode_record(kind, w, blob, keys):
+    if kind == 'raw':
+        return [float(ri16(blob, 2 * i)) for i in range(keys)]
+    if kind == 'const':
+        return [float(_sign_extend(w, 13))] * keys
+    if kind == 'nib':
+        # IMA-ADPCM style: 4-bit sign-magnitude nibbles scaled by an
+        # adaptive step (low byte of the header word = initial step index).
+        cur = float(ri16(blob, 2))
+        idx = blob[0]
+        out = [cur]
+        nibs = []
+        for b in blob[4:]:
+            nibs.append(b & 15)
+            nibs.append(b >> 4)
+        for n in nibs[:keys - 1]:
+            step = ANIM_NIB_STEP[min(max(idx, 0), 63)]
+            idx = min(max(idx + ANIM_NIB_INDEX[n], 0), 63)
+            mag = n & 7
+            delta = step >> 3
+            if mag & 4:
+                delta += step
+            if mag & 2:
+                delta += step >> 1
+            if mag & 1:
+                delta += (step >> 2) + (step & 1)
+            cur += -delta if n & 8 else delta
+            out.append(cur)
+        while len(out) < keys:
+            out.append(cur)
+        return out
+    if kind == 'seg':
+        cur = float(ri16(blob, 2))
+        out = [cur]
+        for i in range(2, len(blob) // 2):
+            ww = ru16(blob, 2 * i)
+            run = ww & 31
+            delta = float(_sign_extend(ww >> 5, 11))
+            if run == 0:
+                cur += delta
+                continue
+            for r in range(1, run + 1):
+                out.append(cur + delta * r / run)
+            cur += delta
+        out = out[:keys]
+        while len(out) < keys:
+            out.append(cur)
+        return out
+    return [0.0] * keys
+
+
+def _anim_plane_bits(plane):
+    for i in range(len(plane) * 8):
+        if (plane[i >> 3] >> (i & 7)) & 1:
+            yield i // 3, i % 3
+
+
+def _anim_channel_list(hdr, mesh_bone_count, channel_count):
+    """Ordered list of (plane, bone, axis) described by a channel header."""
+    if not hdr:
+        return []
+    flags = hdr[0]
+    present = [k for k in range(3) if flags >> k & 1]
+    if not present:
+        return []
+    body = hdr[1:]
+    if len(present) == 1:
+        plane_size = len(body)
+    else:
+        plane_size = (mesh_bone_count * 3 + 7) // 8
+        if 1 + plane_size * len(present) > len(hdr):
+            plane_size = len(body) // len(present)
+    sets = {}
+    pos = 0
+    for k in present:
+        sets[k] = set(_anim_plane_bits(body[pos:pos + plane_size]))
+        pos += plane_size
+    max_bones = plane_size * 8 // 3 + 1
+    out = []
+    bone_order = [k for k in (ANIM_PLANE_ROT, ANIM_PLANE_TRANS, ANIM_PLANE_SCALE) if k in present]
+    for b in range(max_bones):
+        for k in bone_order:
+            for ax in range(3):
+                if (b, ax) in sets[k]:
+                    out.append((k, b, ax))
+        if len(out) >= channel_count:
+            break
+    return out[:channel_count]
+
+
+def _unwrap_rotation(values):
+    """Make a 4096-unit rotation channel continuous (raw channels wrap)."""
     if not values:
         return values
-    result = []
-    # Wrap first value to [-2048, 2047]
-    v = values[0] % 4096
-    if v >= 2048: v -= 4096
-    result.append(v)
-    for i in range(1, len(values)):
-        v = values[i] % 4096
-        if v >= 2048: v -= 4096
-        # Maintain continuity: adjust by 4096 to minimize jump from previous
-        prev = result[-1]
-        while v - prev > 2048: v -= 4096
-        while v - prev < -2048: v += 4096
-        result.append(v)
-    return result
-
-def _decode_anim_bitmask(data, p_hdr, bpa, bone_count):
-    """Decode the animation bitmask into a list of channels.
-    Each non-zero bitmask entry = exactly 1 curve slot.
-    Bitmask is bone-major with 3 bits per bone.
-    Bit-to-axis mapping: sequential (bit0→axis0, bit1→axis1, bit2→axis2).
-    Returns (channels, n_curve_slots)."""
-    bitmask_start = p_hdr + 2
-    channels = []
-    bit_pos = 0
-    total_bits = bone_count * 3 * bpa
-    for bone in range(bone_count):
-        for axis in range(3):
-            if bit_pos >= total_bits: break
-            bval = 0
-            for b in range(bpa):
-                byte_i = (bit_pos + b) // 8
-                bit_i = (bit_pos + b) % 8
-                if bitmask_start + byte_i < len(data):
-                    bval |= ((data[bitmask_start + byte_i] >> bit_i) & 1) << b
-            if bval > 0:
-                c = AnimChannel()
-                c.bone_index = bone
-                c.axis = axis
-                c.component_type = bval
-                c.component = 'R'
-                channels.append(c)
-            bit_pos += bpa
-    return channels, len(channels)
-
-def _try_raw_i16_decode(data, p_crv, crv_bytes, n_slots, frame_count):
-    """Try to decode curve data as sequential raw i16 per channel slot.
-    n_slots is the number of value slots from the expanded bitmask.
-    Only succeeds if the data size is plausible for raw storage."""
-    if n_slots == 0 or frame_count < 1:
-        return None
-    
-    # Quick reject: if data is less than 50% of expected raw size, it's compressed
-    expected_raw = n_slots * frame_count * 2
-    if crv_bytes < expected_raw * 0.5:
-        return None
-    
-    total_i16 = crv_bytes // 2
-    
-    # Find best sample count
-    candidates = set()
-    if total_i16 >= n_slots:
-        exact = total_i16 // n_slots
-        for delta in range(-2, 3):
-            c = exact + delta
-            if c >= frame_count - 2 and c <= frame_count + 5:
-                if n_slots * c * 2 <= crv_bytes + 4:
-                    candidates.add(c)
-    if n_slots * frame_count * 2 <= crv_bytes + 4:
-        candidates.add(frame_count)
-    if n_slots * (frame_count + 1) * 2 <= crv_bytes + 4:
-        candidates.add(frame_count + 1)
-    
-    if not candidates:
-        return None
-    
-    best_ns = None
-    best_smooth = -1
-    for ns in sorted(candidates):
-        if n_slots * ns * 2 > crv_bytes + 4:
-            continue
-        if ns < max(3, frame_count - 5):
-            continue
-        if p_crv + n_slots * ns * 2 > len(data):
-            continue
-        
-        smooth = 0
-        for ci in range(n_slots):
-            off = p_crv + ci * ns * 2
-            if off + ns * 2 > len(data):
-                break
-            vals = [ri16(data, off + i * 2) for i in range(ns)]
-            max_d = 0
-            for i in range(1, ns):
-                d = abs(vals[i] - vals[i - 1])
-                if d > 2048:
-                    d = 4096 - d
-                max_d = max(max_d, d)
-            if max_d < 400:
-                smooth += 1
-        if smooth > best_smooth:
-            best_smooth = smooth
-            best_ns = ns
-    
-    if best_ns is None or best_smooth < max(1, int(n_slots * 0.6)):
-        return None
-    
-    # Decode: return list of lists (one per slot)
-    result = []
-    for ci in range(n_slots):
-        off = p_crv + ci * best_ns * 2
-        if off + best_ns * 2 > len(data):
-            result.append([0.0] * frame_count)
-            continue
-        raw = [ri16(data, off + i * 2) for i in range(best_ns)]
-        if len(raw) >= frame_count:
-            result.append([float(raw[i]) for i in range(frame_count)])
-        else:
-            out = []
-            for fi in range(frame_count):
-                t = fi * (len(raw) - 1) / max(1, frame_count - 1)
-                idx = int(t); frac = t - idx
-                if idx >= len(raw) - 1:
-                    out.append(float(raw[-1]))
-                else:
-                    out.append(raw[idx] * (1.0 - frac) + raw[idx + 1] * frac)
-            result.append(out)
-    return result
+    out = [values[0]]
+    for v in values[1:]:
+        prev = out[-1]
+        while v - prev > ANIM_ROT_UNIT / 2:
+            v -= ANIM_ROT_UNIT
+        while v - prev < -ANIM_ROT_UNIT / 2:
+            v += ANIM_ROT_UNIT
+        out.append(v)
+    return out
 
 
-def _decode_compressed_blocks(data, p_crv, crv_bytes, n_slots, frame_count):
-    """Decode block-compressed curve data.
-    Block stream format: [lo_byte, mode_byte, data...]
-      mode 0x60: constant – (lo-1) i16 values, each a channel held for all frames
-      mode 0x40: 4-bit nibble delta – channels with i16 init + packed nibble deltas
-      mode 0x20: 8-bit byte delta – channels with i16 init + packed byte deltas
-    Returns list of lists (one per decoded slot), or None on failure."""
-    if crv_bytes < 2 or frame_count < 1:
-        return None
-    
-    end = min(p_crv + crv_bytes, len(data))
-    result = []
-    pos = p_crv
-    
-    nib_bytes_per_ch = ((frame_count - 1) + 1) // 2  # ceil(deltas/2)
-    byte_per_ch = frame_count - 1
-    
-    while pos + 2 <= end and len(result) < n_slots + 50:
-        lo = data[pos]
-        mode = data[pos + 1]
-        
-        if mode not in (0x20, 0x40, 0x60) or lo < 2:
-            break
-        
-        block_bytes = lo * 2
-        if pos + block_bytes > end:
-            break
-        
-        data_words = lo - 1  # words of data after header
-        
-        if mode == 0x60:
-            # Constant: each data word is one channel's value for all frames
-            for wi in range(data_words):
-                v = ri16(data, pos + 2 + wi * 2)
-                result.append([float(v)] * frame_count)
-        
-        elif mode == 0x40:
-            # 4-bit nibble delta channels
-            # Per channel: 2-byte i16 init + nib_bytes_per_ch packed nibble bytes
-            bpc = 2 + nib_bytes_per_ch
-            n_ch = (data_words * 2) // bpc  # how many channels fit
-            for ci in range(n_ch):
-                ch_off = pos + 2 + ci * bpc
-                if ch_off + bpc > end:
-                    break
-                init = ri16(data, ch_off)
-                nibbles = []
-                for nb in range(nib_bytes_per_ch):
-                    bv = data[ch_off + 2 + nb]
-                    nibbles.append(bv & 0x0F)
-                    nibbles.append((bv >> 4) & 0x0F)
-                # Convert to signed 4-bit: 8-15 → negative
-                signed = [(n - 16) if n >= 8 else n for n in nibbles[:frame_count - 1]]
-                vals = [float(init)]
-                for d in signed:
-                    vals.append(vals[-1] + d)
-                # Pad to frame_count if needed
-                while len(vals) < frame_count:
-                    vals.append(vals[-1])
-                result.append(vals[:frame_count])
-        
-        elif mode == 0x20:
-            # 8-bit byte delta channels
-            # Per channel: 2-byte i16 init + (frame_count-1) byte deltas
-            bpc = 2 + byte_per_ch
-            n_ch = (data_words * 2) // bpc
-            for ci in range(n_ch):
-                ch_off = pos + 2 + ci * bpc
-                if ch_off + bpc > end:
-                    break
-                init = ri16(data, ch_off)
-                vals = [float(init)]
-                for d in range(byte_per_ch):
-                    b = data[ch_off + 2 + d]
-                    delta = b - 256 if b >= 128 else b
-                    vals.append(vals[-1] + delta)
-                while len(vals) < frame_count:
-                    vals.append(vals[-1])
-                result.append(vals[:frame_count])
-        
-        pos += block_bytes
-    
-    if len(result) == 0:
-        return None
-    return result
-
-def parse_animations(data, obj_addr, bone_count):
+def read_anim_pointers(data, obj_addr, limit=64):
     val14 = ru32(data, obj_addr + 0x14)
-    if val14 == 0 or val14 >= len(data): return []
-    anim_ptrs = []
-    for j in range(0, 80, 4):
-        if val14 + j + 4 > len(data): break
-        v = ru32(data, val14 + j)
-        if 0x1000 < v < len(data): anim_ptrs.append(v)
-        else: break
-    if not anim_ptrs: return []
-    results = []
-    for ai, aptr in enumerate(anim_ptrs):
-        if aptr + 16 > len(data): continue
-        frame_count = ru16(data, aptr); w1 = ru16(data, aptr + 2)
-        p_hdr = ru32(data, aptr + 4); p_crv = ru32(data, aptr + 8)
-        p_name = ru32(data, aptr + 12)
-        if not (0 < p_hdr < len(data) and 0 < p_crv < len(data)): continue
-        if frame_count == 0 or frame_count > 2000 or p_crv <= p_hdr: continue
-        anim_name = f"anim_{ai}"
-        if 0x1000 < p_name < len(data) - 12:
-            raw_n = data[p_name:p_name + 12]; end = raw_n.find(0)
-            if end > 0:
-                try: anim_name = raw_n[:end].decode('ascii')
-                except: pass
-        ch_byte = data[p_hdr]
-        if ch_byte == 0: continue
-        bpa = _CH_TO_BPA.get(ch_byte, bin(ch_byte).count('1'))
-        if bpa == 0: continue
-        hdr_size = p_crv - p_hdr; bitmask_bytes = hdr_size - 2
-        if bitmask_bytes <= 0: continue
-        channels, n_slots = _decode_anim_bitmask(data, p_hdr, bpa, bone_count)
-        if not channels: continue
-        if ai + 1 < len(anim_ptrs): crv_end = anim_ptrs[ai + 1]
-        else: crv_end = p_crv + min(n_slots * frame_count * 2 + 512, len(data) - p_crv)
-        crv_end = min(crv_end, len(data)); crv_bytes = max(0, crv_end - p_crv)
-        
-        anim = ParsedAnimation(); anim.name = anim_name
-        anim.frame_count = frame_count; anim.w1 = w1; anim.ch = ch_byte
-        anim.channels = channels
-        
-        # Try raw i16 decode first
-        raw_result = _try_raw_i16_decode(data, p_crv, crv_bytes, n_slots, frame_count)
-        if raw_result is not None and len(raw_result) >= len(channels):
-            anim.is_raw = True
-            for ci, ch_obj in enumerate(channels):
-                if ci < len(raw_result):
-                    ch_obj.keyframes = _unwrap_gte_channel(raw_result[ci])
-                else:
-                    ch_obj.keyframes = [0.0] * frame_count
-            print(f"[DFX]     Animation '{anim_name}' raw ({len(channels)}ch/{n_slots}slots, {frame_count}f)")
+    ptrs = []
+    if not (0 < val14 < len(data)):
+        return ptrs
+    for j in range(limit):
+        off = val14 + j * 4
+        if off + 4 > len(data):
+            break
+        v = ru32(data, off)
+        if 0x20 < v < len(data) - 16:
+            ptrs.append(v)
         else:
-            # Try compressed block decode
-            block_result = _decode_compressed_blocks(data, p_crv, crv_bytes, n_slots, frame_count)
-            if block_result is not None and len(block_result) > 0:
-                anim.is_raw = False
-                # Map decoded slots to channels in order
-                for ci, ch_obj in enumerate(channels):
-                    if ci < len(block_result):
-                        ch_obj.keyframes = _unwrap_gte_channel(block_result[ci])
-                    else:
-                        ch_obj.keyframes = [0.0] * frame_count
-                decoded_count = min(len(block_result), len(channels))
-                print(f"[DFX]     Animation '{anim_name}' compressed: decoded {decoded_count}/{len(channels)}ch ({len(block_result)} slots from blocks)")
-            else:
-                anim.is_raw = False
-                for c in channels: c.keyframes = [0.0] * frame_count
-                print(f"[DFX]     Animation '{anim_name}' UNDECODED (ch=0x{ch_byte:02X}, {len(channels)}ch, {crv_bytes}B)")
+            break
+    return ptrs
+
+
+def parse_animations(data, obj_addr, mesh_bone_count):
+    """Parse every bone animation of an object. Returns a list of ParsedAnimation."""
+    results = []
+    for ai, p in enumerate(read_anim_pointers(data, obj_addr)):
+        nch = ru16(data, p)
+        keys = ru16(data, p + 2)
+        p_hdr = ru32(data, p + 4)
+        p_crv = ru32(data, p + 8)
+        p_name = ru32(data, p + 12)
+        if nch == 0 or keys == 0 or keys > 4096:
+            continue
+        if not (0 < p_hdr < p_crv < len(data)):
+            continue
+        anim = ParsedAnimation()
+        anim.record_addr = p
+        anim.channel_count = nch
+        anim.key_count = keys
+        anim.name = f"anim_{ai}"
+        if 0 < p_name < len(data) - 8:
+            raw = data[p_name:p_name + 8]
+            e = raw.find(0)
+            try:
+                nm = (raw[:e] if e >= 0 else raw).decode('ascii').strip('_ ')
+                if nm:
+                    anim.name = nm
+            except Exception:
+                pass
+        hdr = data[p_hdr:p_crv]
+        chlist = _anim_channel_list(hdr, mesh_bone_count, nch)
+        if len(chlist) != nch:
+            anim.warnings.append(
+                f"mask yields {len(chlist)} channels, header says {nch}")
+        pos = p_crv
+        for ci in range(nch):
+            if pos + 2 > len(data):
+                anim.warnings.append("curve stream truncated")
+                break
+            w = ru16(data, pos)
+            ln, kind = _anim_record_length(w, keys)
+            if ln is None or pos + ln > len(data):
+                anim.warnings.append(f"bad record at 0x{pos:X}")
+                break
+            vals = _anim_decode_record(kind, w, data[pos:pos + ln], keys)
+            pos += ln
+            if ci < len(chlist):
+                k, b, ax = chlist[ci]
+                if k == ANIM_PLANE_ROT:
+                    vals = _unwrap_rotation(vals)
+                anim.channels.append(AnimChannel(
+                    bone_index=b, axis=ax, plane=k, kind=kind, keyframes=vals))
         results.append(anim)
     return results
+
 
 
 def _is_tag_byte(b: int) -> bool:
@@ -509,12 +463,36 @@ def decode_vd3_texture_rgba(data: bytes, tex: VD3Texture) -> bytes:
     return bytes(rgba)
 
 
+def _deinterlace_rgba(rgba, w, h):
+    """PS1 stippled semi-transparency: some animated-effect base textures
+    (e.g. x4foam01) store every other row fully transparent so the hardware
+    dithers them.  Detect the pattern and fill the empty rows from their
+    neighbours so the texture looks like it does on screen."""
+    if h < 4:
+        return rgba
+    def row_alpha(y):
+        base = y * w * 4
+        return sum(rgba[base + 3 + x * 4] for x in range(w))
+    empty_even = all(row_alpha(y) == 0 for y in range(0, h, 2))
+    empty_odd = all(row_alpha(y) == 0 for y in range(1, h, 2))
+    if empty_even == empty_odd:
+        return rgba
+    out = bytearray(rgba)
+    start = 0 if empty_even else 1
+    stride = w * 4
+    for y in range(start, h, 2):
+        src = y + 1 if y + 1 < h else y - 1
+        out[y * stride:(y + 1) * stride] = rgba[src * stride:(src + 1) * stride]
+    return bytes(out)
+
+
 def save_texture_png(data: bytes, tex: VD3Texture, out_path: str):
     """Save a VD3 texture as a PNG file using pure Python (minimal dependencies)."""
     import zlib
 
     w, h = tex.width, tex.height
     rgba = decode_vd3_texture_rgba(data, tex)
+    rgba = _deinterlace_rgba(rgba, w, h)
 
     # Build PNG manually (no PIL dependency needed in Blender)
     def _make_chunk(chunk_type: bytes, chunk_data: bytes) -> bytes:
@@ -1101,6 +1079,25 @@ def _get_or_create_material_textured(
         except Exception:
             pass
 
+    # Marker textures the engine never draws: N4*DRAW* ("no draw"
+    # collision-only surfaces) and A4GUIDE (AI guide surface) are
+    # solid-colour placeholders in the VD3.  Hide them like the game does.
+    tag = (tex.tag or "").upper()
+    if (tag.startswith("N4") and "DRAW" in tag) or tag == "A4GUIDE":
+        try:
+            bsdf.inputs['Alpha'].default_value = 0.0
+            for lk in list(links):
+                if lk.to_socket.name == 'Alpha':
+                    links.remove(lk)
+            mat.blend_method = 'BLEND'
+        except Exception:
+            pass
+        try:
+            mat.surface_render_method = 'BLENDED'
+        except Exception:
+            pass
+        mat["dfx_nodraw"] = True
+
     mat_cache[cache_key] = mat
     return mat
 
@@ -1331,22 +1328,20 @@ def _create_armature_for_mesh(
         hx, hy, hz = bone_world_pos[i]
         eb.head = (hx * scale, hy * scale, hz * scale)
 
-        tail_offset = (0, 0, 10 * scale)  # default: 10 units up
-
+        # Bones point along +Y with zero roll so that each bone's local
+        # frame equals the armature frame.  The DFX animation channels are
+        # per-bone Euler rotations / scales / positions expressed in the
+        # parent's frame, so this makes pose-bone transforms map 1:1.
+        length = 10 * scale
         for ci, cb in enumerate(bones):
             if cb.parent_id == i and ci != i:
                 cx, cy, cz = bone_world_pos[ci]
-                dx = (cx - hx) * scale
-                dy = (cy - hy) * scale
-                dz = (cz - hz) * scale
-                length = (dx*dx + dy*dy + dz*dz) ** 0.5
-                if length > 0.001:
-                    tail_offset = (dx, dy, dz)
+                d = ((cx - hx) ** 2 + (cy - hy) ** 2 + (cz - hz) ** 2) ** 0.5 * scale
+                if d > 0.001:
+                    length = d
                 break
-
-        eb.tail = (eb.head[0] + tail_offset[0],
-                   eb.head[1] + tail_offset[1],
-                   eb.head[2] + tail_offset[2])
+        eb.tail = (eb.head[0], eb.head[1] + length, eb.head[2])
+        eb.roll = 0.0
 
         blender_bones.append(eb)
 
@@ -1376,13 +1371,40 @@ def _create_armature_for_mesh(
 
 
 
-def apply_animations_to_armature(arm_obj, animations):
+def apply_animations_to_armature(arm_obj, animations, bones=None, scale=0.01):
+    """Create one Blender action per parsed animation on the armature.
+
+    Rotation: per-axis Euler, 4096 = 360 deg, X applied first (mode 'XYZ').
+    Scale:    1024 = 1.0.
+    Position: absolute bone position in parent space -> pose-bone location
+              is (value - rest_offset) * scale.
+    """
     import math
-    if not animations or arm_obj.type != 'ARMATURE': return
-    for pb in arm_obj.pose.bones: pb.rotation_mode = 'ZYX'
-    if arm_obj.animation_data is None: arm_obj.animation_data_create()
-    
-    # Detect Blender API: 4.4+ removed action.fcurves in favor of slotted actions
+    if not animations or arm_obj.type != 'ARMATURE':
+        return
+    for pb in arm_obj.pose.bones:
+        pb.rotation_mode = 'XYZ'
+    if arm_obj.animation_data is None:
+        arm_obj.animation_data_create()
+
+    rest = {}
+    if bones:
+        for i, b in enumerate(bones):
+            rest[i] = (float(b.local_x), float(b.local_y), float(b.local_z))
+
+    def convert(channel, v):
+        if channel.plane == ANIM_PLANE_ROT:
+            return v / ANIM_ROT_UNIT * 2.0 * math.pi
+        if channel.plane == ANIM_PLANE_SCALE:
+            return v / ANIM_SCALE_UNIT
+        r = rest.get(channel.bone_index, (0.0, 0.0, 0.0))[channel.axis]
+        return (v - r) * scale
+
+    path_of = {ANIM_PLANE_ROT: 'rotation_euler',
+               ANIM_PLANE_SCALE: 'scale',
+               ANIM_PLANE_TRANS: 'location'}
+
+    # Blender 4.4+ removed action.fcurves (slotted actions)
     _use_legacy_fcurves = True
     try:
         test_action = bpy.data.actions.new(name="__dfx_api_test__")
@@ -1390,105 +1412,256 @@ def apply_animations_to_armature(arm_obj, animations):
         bpy.data.actions.remove(test_action)
     except AttributeError:
         _use_legacy_fcurves = False
-        try: bpy.data.actions.remove(test_action)
-        except: pass
-    
+        try:
+            bpy.data.actions.remove(test_action)
+        except Exception:
+            pass
+
     created_actions = []
     for anim in animations:
-        if not anim.channels: continue
-        has_data = any(
-            len(c.keyframes) > 0 and any(abs(v) > 0.01 for v in c.keyframes)
-            for c in anim.channels
-        )
-        if not has_data:
-            print(f"[DFX]     SKIP '{anim.name}': all keyframes zero")
+        for w in anim.warnings:
+            print(f"[DFX]     '{anim.name}': {w}")
+        usable = [c for c in anim.channels
+                  if c.keyframes and
+                  arm_obj.pose.bones.get(f"bone_{c.bone_index:02d}") is not None]
+        skipped = len(anim.channels) - len(usable)
+        if not usable:
+            print(f"[DFX]     SKIP '{anim.name}': no channels match this rig")
             continue
-        # Diagnostics
-        anim_ch = 0; const_ch = 0; zero_ch = 0
-        for c in anim.channels:
-            if not c.keyframes or len(c.keyframes) == 0: zero_ch += 1
-            elif all(abs(v - c.keyframes[0]) < 0.01 for v in c.keyframes): const_ch += 1
-            else: anim_ch += 1
-        all_rot_vals = []
-        for c in anim.channels:
-            if c.keyframes:
-                all_rot_vals.extend(c.keyframes)
-        rot_range = ""
-        if all_rot_vals:
-            mn_raw = min(all_rot_vals); mx_raw = max(all_rot_vals)
-            mn_deg = mn_raw * 360.0 / 4096.0
-            mx_deg = mx_raw * 360.0 / 4096.0
-            rot_range = f" deg=[{mn_deg:.1f},{mx_deg:.1f}]"
-        print(f"[DFX]     '{anim.name}': {anim_ch} animated + {const_ch} const + {zero_ch} zero = {len(anim.channels)} ch, {anim.frame_count}f{rot_range}")
-        
-        action_name = f"{arm_obj.name}_{anim.name}"
-        action = bpy.data.actions.new(name=action_name)
+        kinds = {}
+        for c in usable:
+            kinds[c.kind] = kinds.get(c.kind, 0) + 1
+        planes = sorted({ANIM_PLANE_NAMES[c.plane] for c in usable})
+        print(f"[DFX]     '{anim.name}': {len(usable)} ch "
+              f"({'+'.join(planes)}, {kinds}), {anim.key_count} keys"
+              + (f", {skipped} ch skipped (bone not in mesh)" if skipped else ""))
+
+        action = bpy.data.actions.new(name=f"{arm_obj.name}_{anim.name}")
         action.use_fake_user = True
-        action["dfx_frame_count"] = anim.frame_count
-        action["dfx_w1"] = anim.w1; action["dfx_ch"] = anim.ch
-        action["dfx_is_raw"] = anim.is_raw
-        action["dfx_num_channels"] = len(anim.channels)
-        action["dfx_animated_channels"] = anim_ch
-        
+        action["dfx_frame_count"] = anim.key_count
+        action["dfx_channel_count"] = anim.channel_count
+        action["dfx_record_addr"] = anim.record_addr
+
         has_fcurves = False
-        bones_missing = set()
-        
         if _use_legacy_fcurves:
-            # Legacy path: directly create fcurves on the action (Blender <4.4)
-            for channel in anim.channels:
-                bone_name = f"bone_{channel.bone_index:02d}"
-                pb = arm_obj.pose.bones.get(bone_name)
-                if pb is None: bones_missing.add(bone_name); continue
-                if not channel.keyframes: continue
-                data_path = f'pose.bones["{bone_name}"].rotation_euler'
-                fcurve = action.fcurves.new(data_path=data_path, index=channel.axis)
-                kf_points = fcurve.keyframe_points
-                kf_points.add(len(channel.keyframes))
-                for fi, gte_val in enumerate(channel.keyframes):
-                    kf_points[fi].co = (float(fi + 1), _gte_to_radians(gte_val))
-                    kf_points[fi].interpolation = 'LINEAR'
+            for c in usable:
+                bone_name = f"bone_{c.bone_index:02d}"
+                data_path = f'pose.bones["{bone_name}"].{path_of[c.plane]}'
+                fcurve = action.fcurves.new(data_path=data_path, index=c.axis,
+                                            action_group=bone_name)
+                kps = fcurve.keyframe_points
+                kps.add(len(c.keyframes))
+                for fi, v in enumerate(c.keyframes):
+                    kps[fi].co = (float(fi + 1), convert(c, v))
+                    kps[fi].interpolation = 'LINEAR'
                 fcurve.update()
                 has_fcurves = True
         else:
-            # Modern path: use keyframe_insert (Blender 4.4+)
             arm_obj.animation_data.action = action
-            for fi in range(anim.frame_count):
-                bpy.context.scene.frame_set(fi + 1)
-                for channel in anim.channels:
-                    bone_name = f"bone_{channel.bone_index:02d}"
-                    pb = arm_obj.pose.bones.get(bone_name)
-                    if pb is None:
-                        if fi == 0: bones_missing.add(bone_name)
+            for fi in range(anim.key_count):
+                for c in usable:
+                    if fi >= len(c.keyframes):
                         continue
-                    if not channel.keyframes or fi >= len(channel.keyframes): continue
-                    val = _gte_to_radians(channel.keyframes[fi])
-                    pb.rotation_euler[channel.axis] = val
-                    pb.keyframe_insert(data_path="rotation_euler", index=channel.axis, frame=fi + 1)
+                    pb = arm_obj.pose.bones[f"bone_{c.bone_index:02d}"]
+                    getattr(pb, path_of[c.plane])[c.axis] = convert(c, c.keyframes[fi])
+                    pb.keyframe_insert(data_path=path_of[c.plane], index=c.axis,
+                                       frame=fi + 1)
                     has_fcurves = True
-            # Set interpolation to LINEAR for all created fcurves
             try:
                 for fc in action.fcurves:
                     for kp in fc.keyframe_points:
                         kp.interpolation = 'LINEAR'
-            except: pass
-        
-        if bones_missing:
-            print(f"[DFX]       WARNING: {len(bones_missing)} bones not found: {sorted(bones_missing)[:5]}...")
+            except Exception:
+                pass
+            # reset pose so the next action starts from rest
+            for pb in arm_obj.pose.bones:
+                pb.rotation_euler = (0.0, 0.0, 0.0)
+                pb.scale = (1.0, 1.0, 1.0)
+                pb.location = (0.0, 0.0, 0.0)
+
         if has_fcurves:
-            created_actions.append(action)
+            created_actions.append((anim, action))
         else:
             bpy.data.actions.remove(action)
-            print(f"[DFX]       WARNING: no fcurves created for '{anim.name}'")
-    
+
     if created_actions:
-        arm_obj.animation_data.action = created_actions[0]
-        for action in created_actions[1:]:
-            track = arm_obj.animation_data.nla_tracks.new()
-            track.name = action.name
-            strip = track.strips.new(action.name, int(1), action)
-            strip.action_frame_end = float(action.get("dfx_frame_count", 30))
-            track.mute = True
+        _build_bone_anim_playback(arm_obj, created_actions, bones)
     print(f"[DFX] Applied {len(created_actions)} actions to {arm_obj.name}")
+
+
+# ---- playback planning for bone animations -------------------------------
+#
+# The files hold no loop/once flag for bone animations: that decision lives
+# in the per-object game script.  What the data does tell us is how poses
+# connect, so playback is planned from the curves themselves:
+#   * an animation whose last pose returns to its first pose loops forever
+#   * an animation whose last pose is the first pose of another animation is
+#     a transition into it
+#   * two animations that are each other's transition form a ping-pong pair
+# Anything else is looped as well, since every character seen so far idles
+
+_BONE_POSE_TOL = {0: 60.0, 1: 60.0, 2: 12.0}
+
+
+def _anim_pose_dicts(anim):
+    first, last = {}, {}
+    for c in anim.channels:
+        k = (c.plane, c.bone_index, c.axis)
+        first[k] = c.keyframes[0]
+        last[k] = c.keyframes[-1]
+    return first, last
+
+
+def _pose_default(k, bones):
+    plane, b, ax = k
+    if plane == ANIM_PLANE_ROT:
+        return 0.0
+    if plane == ANIM_PLANE_SCALE:
+        return ANIM_SCALE_UNIT
+    if bones and b < len(bones):
+        return float((bones[b].local_x, bones[b].local_y, bones[b].local_z)[ax])
+    return 0.0
+
+
+def _pose_match(pa, pb, bones):
+    keys = set(pa) | set(pb)
+    if not keys:
+        return 0.0
+    ok = 0
+    for k in keys:
+        a = pa.get(k, _pose_default(k, bones))
+        b = pb.get(k, _pose_default(k, bones))
+        diff = abs(a - b)
+        if k[0] == ANIM_PLANE_ROT:
+            diff = diff % ANIM_ROT_UNIT
+            diff = min(diff, ANIM_ROT_UNIT - diff)
+        if diff <= _BONE_POSE_TOL[k[0]]:
+            ok += 1
+    return ok / len(keys)
+
+
+def _anim_self_loops(anim):
+    tot = closed = 0
+    for c in anim.channels:
+        v = c.keyframes
+        rng = max(v) - min(v)
+        if rng < 8:
+            continue
+        tot += 1
+        if abs(v[-1] - v[0]) <= 0.15 * rng:
+            closed += 1
+    return tot == 0 or closed / tot >= 0.5
+
+
+def _plan_bone_playback(anims, bones):
+    """Return (loops, successor) lists: loops[i] True if anim i closes on
+    itself, successor[i] = index of the anim it transitions into or None."""
+    P = [_anim_pose_dicts(a) for a in anims]
+    loops, succ = [], []
+    for i, a in enumerate(anims):
+        if _anim_self_loops(a):
+            loops.append(True)
+            succ.append(None)
+            continue
+        loops.append(False)
+        best, bs = None, 0.0
+        for j in range(len(anims)):
+            if j == i:
+                continue
+            sc = _pose_match(P[i][1], P[j][0], bones)
+            if sc > bs:
+                bs, best = sc, j
+        succ.append(best if best is not None and bs >= 0.8 else None)
+    return loops, succ
+
+
+def _add_cycles(action, target, mode='REPEAT'):
+    for fc in _action_fcurves(action, target):
+        if len(fc.keyframe_points) > 1 and not any(m.type == 'CYCLES' for m in fc.modifiers):
+            m = fc.modifiers.new('CYCLES')
+            m.mode_before = mode
+            m.mode_after = mode
+
+
+def _nla_strip(track, action, start, name=None):
+    strip = track.strips.new(name or action.name, int(start), action)
+    try:
+        strip.action_frame_end = float(action.get("dfx_frame_count", strip.action_frame_end))
+    except Exception:
+        pass
+    try:
+        if getattr(strip, "action_slot", None) is None and len(action.slots):
+            strip.action_slot = action.slots[0]
+    except Exception:
+        pass
+    return strip
+
+
+def _build_bone_anim_playback(arm_obj, created, bones, target_frames=3000):
+    anims = [a for a, _ in created]
+    actions = [act for _, act in created]
+    loops, succ = _plan_bone_playback(anims, bones)
+    ad = arm_obj.animation_data
+
+    # walk the chain from the primary animation
+    chain, seen = [], set()
+    i = 0
+    while i is not None and i not in seen:
+        seen.add(i)
+        chain.append(i)
+        if loops[i]:
+            break
+        i = succ[i]
+    cycle_start = chain.index(i) if (i is not None and i in seen and not loops[i]) else None
+
+    for idx, act in enumerate(actions):
+        if loops[idx]:
+            act["dfx_play_mode"] = 'loop'
+        elif succ[idx] is not None:
+            act["dfx_play_mode"] = f'then {anims[succ[idx]].name}'
+        else:
+            act["dfx_play_mode"] = 'loop'
+
+    in_sequence = set(chain)
+    if len(chain) == 1 and cycle_start is None:
+        # plain loop: active action + cycles modifier
+        ad.action = actions[0]
+        _add_cycles(actions[0], arm_obj)
+        print(f"[DFX]     playback: '{anims[0].name}' loops")
+    else:
+        ad.action = None
+        track = ad.nla_tracks.new()
+        track.name = "sequence"
+        frame = 1
+        order = list(chain)
+        if cycle_start is not None:
+            head, cyc = order[:cycle_start], order[cycle_start:]
+            seq = head[:]
+            while frame + sum(anims[k].key_count for k in seq) < target_frames and len(seq) < 60:
+                seq += cyc
+            order = seq
+        for n, k in enumerate(order):
+            strip = _nla_strip(track, actions[k], frame, f"{anims[k].name}_{n:02d}")
+            ln = max(1, anims[k].key_count)
+            if n == len(order) - 1 and loops[k]:
+                try:
+                    strip.repeat = max(1.0, float(target_frames - frame) / ln)
+                except Exception:
+                    pass
+            frame += ln
+        desc = ' -> '.join(anims[k].name for k in chain) + (' (ping-pong)' if cycle_start is not None else ' (loop)')
+        print(f"[DFX]     playback: {desc}")
+
+    for idx, act in enumerate(actions):
+        if idx in in_sequence:
+            continue
+        track = ad.nla_tracks.new()
+        track.name = act.name
+        _nla_strip(track, act, 1)
+        track.mute = True
+        if loops[idx]:
+            _add_cycles(act, arm_obj)
+
 
 
 def load_textures_to_blender(
@@ -1650,6 +1823,13 @@ class PlacementRecord:
     flags: int = 0             # u16 at +14
     draw_distance: int = 0
     anim_rec: dict = None  # parsed per-instance animation record
+    obj_flags: int = 0         # object header flags (obj+0x00)
+    tilt_x: int = 0            # +0x08 i16: pitch (4096 = 360deg)
+    tilt_y: int = 0            # +0x0A i16: roll  (4096 = 360deg)
+    param_ptr: int = 0         # +0x04 u32: optional per-object parameter block
+    intro_dist: int = 0        # object intro radius (i16 at obj+0x1A): the engine
+                               # spawns the instance when the camera comes within
+                               # this 3D distance of the placement position
 
 
 def extract_placement_table(data: bytes) -> List[PlacementRecord]:
@@ -1696,9 +1876,15 @@ def extract_placement_table(data: bytes) -> List[PlacementRecord]:
         rec.flags = ru16(data, roff + 14)
         rec.draw_distance = ri16(data, roff + 22)
         # Per-instance animation record pointer at +0x24
+        rec.param_ptr = ru32(data, roff + 0x04)
+        rec.tilt_x = ri16(data, roff + 0x08)
+        rec.tilt_y = ri16(data, roff + 0x0A)
         anim_ptr = ru32(data, roff + 0x24)
+        if 0 < rec.obj_ptr < len(data) - 4:
+            rec.obj_flags = ru32(data, rec.obj_ptr)
+            rec.intro_dist = ri16(data, rec.obj_ptr + 0x1A)
         if anim_ptr > 0 and anim_ptr < len(data):
-            rec.anim_rec = parse_instance_anim_record(data, anim_ptr)
+            rec.anim_rec = parse_instance_anim_record(data, anim_ptr, rec.obj_flags)
         else:
             rec.anim_rec = None
         records.append(rec)
@@ -1815,89 +2001,353 @@ def create_level_anim_curve(waypoints, scale, collection):
 
 
 
-def parse_instance_anim_record(data, rec_addr):
-    """Parse a per-instance animation record at the given address.
-    Returns a dict with record type, size, tilt angle, and path waypoints."""
-    import math
-    if rec_addr <= 0 or rec_addr + 0x40 > len(data):
+# =========================================================================
+#  Per-instance animation records (position / rotation / scale tracks)
+# =========================================================================
+#
+# Placement record +0x24 points to an animation record: an array of track
+# pointers, slot 0 = position, slot 1 = rotation, slot 2 = scale (a slot
+# may be 0).  Each track header is 8 bytes:
+#     +0 u32 keys_ptr, +4 s16 key_count, +6 u8 kind (0/1/2), +7 u8 flags
+# flags: 0x04 = loop (restart at key 0; the final key is only the
+#        interpolation target of the previous one), 0x01 = play once.
+#
+# Position / scale keys are 40 bytes:
+#     +0 u16 duration in frames until the next key
+#     +2 i16 x, +4 i16 y, +6 i16 z   (absolute world units / 4096 = 1.0 scale)
+#     +8  i32 out_tangent[3], +20 i32 in_tangent[3], +32 8 bytes unused
+#   and are interpolated with a cubic Hermite:
+#     P(t) = h00*P0 + h10*out0 + h01*P1 + h11*in1
+# Rotation keys are 10 bytes:
+#     +0 u16 duration, +2 i16 qx, qy, qz, qw (4096 = 1.0), slerped.
+#
+# When a non-looping track reaches its end the engine reverses playback
+# (ping-pong) unless the object header flags (obj+0) contain 0x8000 or
+# 0x80000 (stop at end), 0x20000 (one-shot) or 0x40000 (no reverse).
+
+INST_TRACK_POS, INST_TRACK_ROT, INST_TRACK_SCALE = 0, 1, 2
+INST_TRACK_LOOP = 0x04
+
+
+def _read_track(data, hdr_addr):
+    if not (0 < hdr_addr < len(data) - 8):
         return None
-    
-    # Find record size by scanning for CDCD terminator
-    rec_size = -1
-    for scan in range(0, 8000, 2):
-        if rec_addr + scan + 2 > len(data):
-            break
-        if ru16(data, rec_addr + scan) == 0xCDCD:
-            rec_size = scan + 2
-            break
-    
-    flags38 = ru32(data, rec_addr + 0x38) if rec_addr + 0x3C <= len(data) else 0
-    p20 = ru32(data, rec_addr + 0x20) if rec_addr + 0x24 <= len(data) else 0
-    p34 = ru32(data, rec_addr + 0x34) if rec_addr + 0x38 <= len(data) else 0
-    
-    result = {
+    keys_ptr = ru32(data, hdr_addr)
+    count = ri16(data, hdr_addr + 4)
+    kind = data[hdr_addr + 6]
+    flags = data[hdr_addr + 7]
+    if count <= 0 or count > 4096 or kind > 2:
+        return None
+    if not (0 < keys_ptr < len(data)):
+        return None
+    keys = []
+    if kind == INST_TRACK_ROT:
+        for i in range(count):
+            o = keys_ptr + i * 10
+            if o + 10 > len(data):
+                break
+            keys.append({
+                'dur': ru16(data, o),
+                'quat': (ri16(data, o + 2), ri16(data, o + 4),
+                         ri16(data, o + 6), ri16(data, o + 8)),
+            })
+    else:
+        for i in range(count):
+            o = keys_ptr + i * 40
+            if o + 40 > len(data):
+                break
+            keys.append({
+                'dur': ru16(data, o),
+                'pos': (ri16(data, o + 2), ri16(data, o + 4), ri16(data, o + 6)),
+                'out': (ri32(data, o + 8), ri32(data, o + 12), ri32(data, o + 16)),
+                'in': (ri32(data, o + 20), ri32(data, o + 24), ri32(data, o + 28)),
+            })
+    return {'addr': hdr_addr, 'kind': kind, 'flags': flags,
+            'loop': bool(flags & INST_TRACK_LOOP), 'keys': keys}
+
+
+def parse_instance_anim_record(data, rec_addr, obj_flags=0):
+    """Parse the animation record of a placement. Returns a dict with the
+    three tracks (may be None) and the playback mode, or None."""
+    if rec_addr <= 0 or rec_addr + 12 > len(data):
+        return None
+    tracks = {}
+    for slot, name in ((0, 'pos'), (1, 'rot'), (2, 'scale')):
+        hdr = ru32(data, rec_addr + slot * 4)
+        tracks[name] = _read_track(data, hdr) if hdr else None
+    if not any(tracks.values()):
+        return None
+    # End-of-track behaviour from the engine's instance updater: a finished
+    # non-looping track reverses direction (ping-pong) unless the object
+    # flags say otherwise: 0x8000/0x80000 deactivate at the end, 0x20000
+    # freezes, 0x10000 kills the instance, 0x40000 suppresses the reverse.
+    STOP_FLAGS = 0x8000 | 0x80000 | 0x20000 | 0x10000 | 0x40000
+    loop = any(t and t['loop'] for t in tracks.values())
+    if loop:
+        mode = 'loop'
+    elif obj_flags & STOP_FLAGS:
+        mode = 'once'
+    else:
+        mode = 'pingpong'
+    pos = tracks['pos']
+    waypoints = [tuple(float(v) for v in k['pos']) for k in pos['keys']] if pos else []
+    return {
         'addr': rec_addr,
-        'size': rec_size,
-        'flags': flags38,
-        'waypoints': [],
+        'tracks': tracks,
+        'mode': mode,
+        'waypoints': waypoints,
+        'type': 'track',
     }
-    
-    # simple_coord (112 bytes): static tilt matrix
-    if rec_size == 112 and flags38 in (0x04010005,):
-        result['type'] = 'simple_coord'
-        A = ri16(data, rec_addr + 0x42)
-        B = ri16(data, rec_addr + 0x44)
-        if A != 0 or B != 0:
-            result['tilt_angle_rad'] = math.atan2(-B, A)
-        else:
-            result['tilt_angle_rad'] = 0.0
-        return result
-    
-    # Type B: animated_path (data at +0x34, flags at +0x38)
-    # Used by airbal, tttruck (0x0400), msfairy, scripted entities (0x0100)
-    # Frame-by-frame positions in 40-byte blocks
-    # Same field layout as large_path: +0x02=X, +0x04=Y, +0x06=Z (all i16)
-    f38_hi = flags38 >> 16
-    if p34 > 0 and p34 < len(data) and f38_hi in (0x0400, 0x0100):
-        result['type'] = 'animated_path'
-        frame_count = flags38 & 0xFFFF
-        waypoints = []
-        for fi in range(frame_count):
-            foff = p34 + fi * 40
-            if foff + 8 > len(data):
-                break
-            x = ri16(data, foff + 2)        # i16 position X
-            y = ri16(data, foff + 4)        # i16 position Y
-            z = ri16(data, foff + 6)        # i16 position Z (height)
-            waypoints.append((float(x), float(y), float(z)))
-        result['waypoints'] = waypoints
-        return result
-    
-    # Type A: large_path / AI path (data at +0x20)
-    # 40-byte waypoint blocks at rec+0x50
-    # Position: i16 X at +0x02, i16 Y at +0x04, i16 Z at +0x06
-    # Read until seg=0 terminator (u16 at +0x00 of block)
-    if p20 > 0 and p20 < len(data):
-        result['type'] = 'large_path'
-        
-        waypoints = []
-        for wi in range(2000):  # safety limit
-            base = rec_addr + 0x50 + wi * 40
-            if base + 8 > len(data):
-                break
-            seg = ru16(data, base)
-            if seg == 0 and wi > 0:
-                break  # terminator
-            x = ri16(data, base + 2)        # i16 position X
-            y = ri16(data, base + 4)        # i16 position Y
-            z = ri16(data, base + 6)        # i16 position Z (height)
-            waypoints.append((float(x), float(y), float(z)))
-        result['waypoints'] = waypoints
-        return result
-    
-    # Unknown record type
-    result['type'] = 'unknown'
-    return result
+
+
+def _track_frame_times(keys, offset=0.0):
+    """Cumulative start frame of every key (frame 1 + offset = first key)."""
+    times = []
+    f = 0.0
+    for k in keys:
+        times.append(1.0 + offset + f)
+        f += k['dur']
+    return times
+
+
+def _action_fcurves(action, target):
+    """F-curves of an action, for both legacy and slotted (4.4+) actions."""
+    try:
+        return list(action.fcurves)
+    except AttributeError:
+        pass
+    try:
+        slot = target.animation_data.action_slot
+        for layer in action.layers:
+            for strip in layer.strips:
+                cb = strip.channelbag(slot)
+                if cb is not None:
+                    return list(cb.fcurves)
+    except Exception:
+        pass
+    return []
+
+
+def _create_track_path_curve(name, track, scale, cyclic, collection):
+    """Bezier curve through the position keys, handles from the Hermite
+    tangents so the curve shows the exact path the engine interpolates."""
+    keys = track['keys']
+    if len(keys) < 2:
+        return None
+    curve_data = bpy.data.curves.new(name, type='CURVE')
+    curve_data.dimensions = '3D'
+    curve_data.resolution_u = 12
+    spline = curve_data.splines.new('BEZIER')
+    spline.bezier_points.add(len(keys) - 1)
+    for i, k in enumerate(keys):
+        bp = spline.bezier_points[i]
+        p = [v * scale for v in k['pos']]
+        bp.co = p
+        bp.handle_left_type = 'FREE'
+        bp.handle_right_type = 'FREE'
+        bp.handle_right = [p[a] + k['out'][a] * scale / 3.0 for a in range(3)]
+        bp.handle_left = [p[a] - k['in'][a] * scale / 3.0 for a in range(3)]
+    spline.use_cyclic_u = cyclic
+    path_obj = bpy.data.objects.new(name, curve_data)
+    path_obj["dfx_path_points"] = len(keys)
+    path_obj["dfx_path_loop"] = track['loop']
+    path_obj.display_type = 'WIRE'
+    path_obj.show_in_front = True
+    collection.objects.link(path_obj)
+    return path_obj
+
+
+# ---- instance spawn timing (reverse-engineered from the game code) -------
+#
+# The engine streams instances: INSTANCE_IntroduceInstance runs when the
+# camera focus point comes within the object's intro radius (i16 at
+# obj+0x1A) of the placement position (3D distance), and the instance is
+# removed again beyond obj+0x1C.  Track state (anim record +0x10) is
+# zero-initialised in the file, so a track starts playing the moment its
+# instance spawns.  During the level intro the focus point follows the
+# flyover camera track
+
+def _camera_position_samples(placements):
+    """Per-frame (x, y, z) of the level's scripted flyover camera, or None."""
+    for rec in placements:
+        if rec.obj_ptr != 0 or rec.anim_rec is None:
+            continue
+        pos = rec.anim_rec['tracks'].get('pos')
+        if not pos or len(pos['keys']) < 2:
+            continue
+        samples = []
+        keys = pos['keys']
+        for i in range(len(keys) - 1):
+            a, b = keys[i], keys[i + 1]
+            dur = max(1, a['dur'])
+            for t in range(dur):
+                u = t / dur
+                samples.append(tuple(a['pos'][k] + (b['pos'][k] - a['pos'][k]) * u
+                                     for k in range(3)))
+        samples.append(tuple(keys[-1]['pos']))
+        return samples
+    return None
+
+
+def _instance_spawn_frame(rec, cam_samples):
+    """First flyover frame at which the engine spawns this instance: the
+    camera within the object's intro radius of the placement (3D).
+    Returns 0 if spawned from the start, None if never during the intro."""
+    if not cam_samples or rec.intro_dist <= 0:
+        return 0
+    r2 = rec.intro_dist * rec.intro_dist
+    for f, (cx, cy, cz) in enumerate(cam_samples):
+        dx, dy, dz = cx - rec.x, cy - rec.y, cz - rec.z
+        if dx * dx + dy * dy + dz * dz < r2:
+            return f
+    return None
+
+
+def _shift_nla_sequence(anim_data, offset):
+    """Move every strip of unmuted NLA tracks later by `offset` frames.
+    Strips are rebuilt at the shifted positions because frame_start_ui /
+    frame_end_ui are resize handles and do not reliably translate strips."""
+    if offset <= 0:
+        return
+    for track in anim_data.nla_tracks:
+        if track.mute:
+            continue
+        specs = []
+        for strip in track.strips:
+            specs.append((
+                strip.name,
+                strip.frame_start,
+                strip.action,
+                getattr(strip, "action_frame_start", None),
+                strip.action_frame_end,
+                getattr(strip, "repeat", 1.0),
+                getattr(strip, "action_slot", None),
+            ))
+        for strip in list(track.strips):
+            track.strips.remove(strip)
+        for name, fs, action, afs, afe, rep, slot in specs:
+            if action is None:
+                continue
+            strip = track.strips.new(name, int(fs + offset), action)
+            try:
+                if afs is not None:
+                    strip.action_frame_start = afs
+                strip.action_frame_end = afe
+                strip.repeat = rep
+            except Exception:
+                pass
+            try:
+                if slot is not None:
+                    strip.action_slot = slot
+            except Exception:
+                pass
+
+
+def apply_instance_tracks(target, anim, scale, name, frame_offset=0):
+    """Keyframe an instance object from its position / rotation / scale
+    tracks. One game tick = one Blender frame, starting at frame
+    1 + frame_offset. If the object already has animation (a bone-animated
+    armature), the track goes onto an NLA strip so both play together."""
+    tracks = anim['tracks']
+    mode = anim['mode']
+    if target.animation_data is None:
+        target.animation_data_create()
+    prev_action = target.animation_data.action
+    had_anim = prev_action is not None or len(target.animation_data.nla_tracks) > 0
+    action = bpy.data.actions.new(name=f"{name}_track")
+    action.use_fake_user = True
+    target.animation_data.action = action
+    action["dfx_play_mode"] = mode
+    fcurve_meta = {}   # data_path -> per-key (frame, handles) for Bezier
+
+    pos = tracks.get('pos')
+    if pos and pos['keys']:
+        keys = pos['keys']
+        times = _track_frame_times(keys, frame_offset)
+        hl = {}
+        for i, k in enumerate(keys):
+            f = times[i]
+            target.location = tuple(v * scale for v in k['pos'])
+            target.keyframe_insert(data_path="location", frame=f)
+            d_next = keys[i]['dur'] if i < len(keys) - 1 else (keys[i - 1]['dur'] if i else 1)
+            d_prev = keys[i - 1]['dur'] if i else d_next
+            p = [v * scale for v in k['pos']]
+            hl[i] = (
+                f,
+                [(f - d_prev / 3.0, p[a] - k['in'][a] * scale / 3.0) for a in range(3)],
+                [(f + d_next / 3.0, p[a] + k['out'][a] * scale / 3.0) for a in range(3)],
+            )
+        fcurve_meta["location"] = hl
+        action["dfx_pos_keys"] = len(keys)
+
+    rot = tracks.get('rot')
+    if rot and rot['keys']:
+        keys = rot['keys']
+        times = _track_frame_times(keys, frame_offset)
+        target.rotation_mode = 'QUATERNION'
+        prev = None
+        for i, k in enumerate(keys):
+            x, y, z, w = (v / 4096.0 for v in k['quat'])
+            q = [w, x, y, z]
+            n = (q[0] ** 2 + q[1] ** 2 + q[2] ** 2 + q[3] ** 2) ** 0.5 or 1.0
+            q = [v / n for v in q]
+            if prev is not None and sum(a * b for a, b in zip(q, prev)) < 0:
+                q = [-v for v in q]
+            prev = q
+            target.rotation_quaternion = q
+            target.keyframe_insert(data_path="rotation_quaternion", frame=times[i])
+        action["dfx_rot_keys"] = len(keys)
+
+    scl = tracks.get('scale')
+    if scl and scl['keys']:
+        keys = scl['keys']
+        times = _track_frame_times(keys, frame_offset)
+        for i, k in enumerate(keys):
+            target.scale = tuple(v / 4096.0 for v in k['pos'])
+            target.keyframe_insert(data_path="scale", frame=times[i])
+
+    total = 0
+    main = pos or rot or scl
+    if main:
+        total = sum(k['dur'] for k in main['keys'])
+    action["dfx_total_frames"] = total
+
+    for fc in _action_fcurves(action, target):
+        meta = fcurve_meta.get(fc.data_path)
+        for i, kp in enumerate(fc.keyframe_points):
+            if meta is not None and i in meta:
+                f, left, right = meta[i]
+                kp.interpolation = 'BEZIER'
+                kp.handle_left_type = 'FREE'
+                kp.handle_right_type = 'FREE'
+                kp.handle_left = left[fc.array_index]
+                kp.handle_right = right[fc.array_index]
+            else:
+                kp.interpolation = 'LINEAR'
+        if mode in ('loop', 'pingpong') and len(fc.keyframe_points) > 1:
+            mod = fc.modifiers.new('CYCLES')
+            mod.mode_after = 'REPEAT' if mode == 'loop' else 'MIRROR'
+            mod.mode_before = 'REPEAT' if mode == 'loop' else 'NONE'
+        fc.update()
+
+    if had_anim:
+        # The armature already plays a bone animation: keep it and put the
+        # object-level track on its own NLA strip instead.
+        target.animation_data.action = prev_action
+        track = target.animation_data.nla_tracks.new()
+        track.name = f"{name}_path"
+        strip = track.strips.new(action.name, int(1 + frame_offset), action)
+        try:
+            if getattr(strip, "action_slot", None) is None and len(action.slots):
+                strip.action_slot = action.slots[0]
+        except Exception:
+            pass
+        if mode == 'loop' and total > 0:
+            try:
+                strip.repeat = max(1.0, 3000.0 / total)
+            except Exception:
+                pass
+    return action
 
 
 def apply_placements(
@@ -1913,31 +2363,41 @@ def apply_placements(
     from collections import Counter
     ptr_counter = Counter()
 
+    cam_samples = _camera_position_samples(placements)
+
     for rec in placements:
         # Handle null-model instances (camera paths, sound emitters, triggers)
         if rec.obj_ptr not in obj_ptr_to_blender:
-            if rec.obj_ptr == 0 and hasattr(rec, 'anim_rec') and rec.anim_rec is not None:
-                # Create an Empty for invisible entities with animation
+            if rec.obj_ptr == 0 and rec.anim_rec is not None:
+                # Null-model instance with tracks: the level's scripted
+                # camera. Build an Empty that follows the tracks and a
+                # camera child looking along the Empty's +Y axis.
                 ar = rec.anim_rec
-                anim_type = ar.get('type', 'none')
-                wps = ar.get('waypoints', [])
-                if anim_type in ('animated_path', 'large_path') and len(wps) >= 2:
-                    path_name = f"camera_path_{len(wps)}f"
-                    curve_data = bpy.data.curves.new(path_name, type='CURVE')
-                    curve_data.dimensions = '3D'
-                    curve_data.resolution_u = 12
-                    spline = curve_data.splines.new('POLY')
-                    spline.points.add(len(wps) - 1)
-                    for wi, (wx, wy, wz) in enumerate(wps):
-                        spline.points[wi].co = (
-                            wx * scale, wy * scale, wz * scale, 1.0)
-                    path_obj = bpy.data.objects.new(path_name, curve_data)
-                    path_obj["dfx_path_type"] = anim_type
-                    path_obj["dfx_path_points"] = len(wps)
-                    path_obj["dfx_null_model"] = True
-                    path_obj.display_type = 'WIRE'
-                    path_obj.show_in_front = True
-                    collection.objects.link(path_obj)
+                if ar['mode'] == 'pingpong':
+                    ar['mode'] = 'once'   # the flyover plays once, then the race starts
+                ptr_counter[0] += 1
+                cam_name = f"camera_{ptr_counter[0]:02d}"
+                empty = bpy.data.objects.new(cam_name, None)
+                empty.empty_display_type = 'ARROWS'
+                empty.empty_display_size = 50 * scale
+                empty.location = (rec.x * scale, rec.y * scale, rec.z * scale)
+                empty["dfx_null_model"] = True
+                empty["dfx_anim_mode"] = ar['mode']
+                collection.objects.link(empty)
+                cam_data = bpy.data.cameras.new(cam_name)
+                cam_data.clip_end = 100000 * scale
+                cam_obj = bpy.data.objects.new(f"{cam_name}_view", cam_data)
+                cam_obj.parent = empty
+                cam_obj.rotation_euler = (math.pi / 2.0, 0.0, 0.0)
+                collection.objects.link(cam_obj)
+                pos = ar['tracks'].get('pos')
+                if pos:
+                    _create_track_path_curve(f"{cam_name}_path", pos, scale,
+                                             ar['mode'] == 'loop', collection)
+                try:
+                    apply_instance_tracks(empty, ar, scale, cam_name)
+                except Exception as e:
+                    print(f"[DFX]   WARNING: camera track failed: {e}")
             continue
 
         source_obj = obj_ptr_to_blender[rec.obj_ptr]
@@ -1959,8 +2419,19 @@ def apply_placements(
             new_arm.data = source_arm.data.copy()
             new_arm.name = f"{inst_name}_armature"
             new_arm.location = (rec.x * scale, rec.y * scale, rec.z * scale)
-            new_arm.rotation_euler = (0, 0, rot_rad)
+            tilt = (rec.tilt_x / 4096.0 * 2 * math.pi,
+                    rec.tilt_y / 4096.0 * 2 * math.pi)
+            new_arm.rotation_euler = (tilt[0], tilt[1], rot_rad)
             collection.objects.link(new_arm)
+
+            # Spawn timing: shift one-shot sequences to the frame the
+            # engine spawns this instance during the intro flyover
+            _spawn = 0
+            if cam_samples is not None and source_arm.animation_data:
+                _has_seq = any((not t.mute) and t.name == "sequence"
+                               for t in source_arm.animation_data.nla_tracks)
+                if _has_seq:
+                    _spawn = _instance_spawn_frame(rec, cam_samples) or 0
 
             # Deep-copy animation_data (NLA tracks, strips, actions)
             if source_arm.animation_data:
@@ -1979,6 +2450,22 @@ def apply_placements(
                                 int(src_strip.frame_start),
                                 src_strip.action)
                             dst_strip.action_frame_end = src_strip.action_frame_end
+                            try:
+                                dst_strip.repeat = src_strip.repeat
+                                dst_strip.action_frame_start = src_strip.action_frame_start
+                            except Exception:
+                                pass
+                            try:
+                                if getattr(src_strip, "action_slot", None) is not None:
+                                    dst_strip.action_slot = src_strip.action_slot
+                            except Exception:
+                                pass
+
+            if _spawn:
+                _shift_nla_sequence(new_arm.animation_data, _spawn)
+                new_arm["dfx_spawn_frame"] = _spawn
+                print(f"[DFX]     {inst_name}: spawns at intro frame {_spawn + 1} "
+                      f"(camera within {rec.intro_dist} units)")
 
             # Duplicate the mesh (linked = shares mesh data)
             new_obj = source_obj.copy()
@@ -1999,7 +2486,9 @@ def apply_placements(
             new_obj = source_obj.copy()
             new_obj.name = inst_name
             new_obj.location = (rec.x * scale, rec.y * scale, rec.z * scale)
-            new_obj.rotation_euler = (0, 0, rot_rad)
+            tilt = (rec.tilt_x / 4096.0 * 2 * math.pi,
+                    rec.tilt_y / 4096.0 * 2 * math.pi)
+            new_obj.rotation_euler = (tilt[0], tilt[1], rot_rad)
             collection.objects.link(new_obj)
 
         # Store placement metadata
@@ -2009,64 +2498,49 @@ def apply_placements(
         new_obj["dfx_flags"] = rec.flags
         new_obj["dfx_draw_distance"] = rec.draw_distance
 
-        # Parse per-instance animation record if present
-        if hasattr(rec, 'anim_rec') and rec.anim_rec is not None:
+        if rec.param_ptr:
+            new_obj["dfx_param_ptr"] = rec.param_ptr
+
+        # Runtime FX emitters (water droplets/laps/falls, fireworks...):
+        # their meshes are engine placeholder boxes; the visible effect is a
+        # particle system generated per-frame by the FX module. Hide the box.
+        _fx_base = source_obj.name.split('_', 1)[-1].lower()
+        if _fx_base.startswith('xwtr'):
+            new_obj.display_type = 'WIRE'
+            new_obj.hide_render = True
+            new_obj["dfx_fx_emitter"] = True
+            if 'new_arm' in dir() and source_arm and new_arm:
+                new_arm["dfx_fx_emitter"] = True
+
+        # Per-instance tracks (position / rotation / scale)
+        if rec.anim_rec is not None:
             ar = rec.anim_rec
-            anim_type = ar.get('type', 'none')
-            new_obj["dfx_anim_type"] = anim_type
-            new_obj["dfx_anim_size"] = ar.get('size', -1)
-            
-            if anim_type == 'simple_coord':
-                tilt_rad = ar.get('tilt_angle_rad', 0.0)
-                new_obj["dfx_tilt_angle_deg"] = round(
-                    tilt_rad * 180.0 / 3.14159265, 2)
-                # Apply tilt as X-axis rotation on top of Y heading
-                target = new_arm if source_arm else new_obj
-                target.rotation_euler = (tilt_rad,
-                                         target.rotation_euler[1],
-                                         target.rotation_euler[2])
-            
-            elif anim_type == 'animated_path':
-                wps = ar.get('waypoints', [])
-                if len(wps) >= 2:
-                    path_name = f"{inst_name}_path"
-                    curve_data = bpy.data.curves.new(path_name, type='CURVE')
-                    curve_data.dimensions = '3D'
-                    curve_data.resolution_u = 12
-                    spline = curve_data.splines.new('POLY')
-                    spline.points.add(len(wps) - 1)
-                    for wi, (wx, wy, wz) in enumerate(wps):
-                        spline.points[wi].co = (
-                            wx * scale, wy * scale, wz * scale, 1.0)
-                    path_obj = bpy.data.objects.new(path_name, curve_data)
-                    path_obj["dfx_path_type"] = anim_type
-                    path_obj["dfx_path_points"] = len(wps)
-                    path_obj.display_type = 'WIRE'
-                    path_obj.show_in_front = True
-                    collection.objects.link(path_obj)
-                    new_obj["dfx_path_waypoints"] = len(wps)
-            
-            elif anim_type == 'large_path':
-                # AI path — absolute coordinates, create cyclic poly curve
-                wps = ar.get('waypoints', [])
-                if len(wps) >= 2:
-                    path_name = f"{inst_name}_path"
-                    curve_data = bpy.data.curves.new(path_name, type='CURVE')
-                    curve_data.dimensions = '3D'
-                    curve_data.resolution_u = 12
-                    spline = curve_data.splines.new('POLY')
-                    spline.points.add(len(wps) - 1)
-                    for wi, (wx, wy, wz) in enumerate(wps):
-                        spline.points[wi].co = (
-                            wx * scale, wy * scale, wz * scale, 1.0)
-                    path_obj = bpy.data.objects.new(path_name, curve_data)
-                    path_obj["dfx_path_type"] = anim_type
-                    path_obj["dfx_path_points"] = len(wps)
-                    path_obj.display_type = 'WIRE'
-                    path_obj.show_in_front = True
-                    collection.objects.link(path_obj)
-
-
+            new_obj["dfx_anim_mode"] = ar['mode']
+            target = new_arm if source_arm else new_obj
+            base_name = source_obj.name.split('_', 1)[-1].lower()
+            is_ai = bool(rec.obj_flags & 0x800) or base_name in ('aimain', 'aialt', 'aiintro')
+            pos = ar['tracks'].get('pos')
+            if pos:
+                cyclic = ar['mode'] == 'loop' or (is_ai and 'intro' not in source_obj.name)
+                _create_track_path_curve(f"{inst_name}_path", pos, scale, cyclic, collection)
+                new_obj["dfx_path_waypoints"] = len(pos['keys'])
+            if is_ai:
+                # AI racing lines: data for the CPU karts, nothing to move
+                new_obj["dfx_ai_path"] = True
+            else:
+                spawn = 0
+                if cam_samples is not None and ar['mode'] in ('once', 'pingpong'):
+                    # one-shot tracks start when the engine spawns the
+                    # instance: camera within the object's intro radius
+                    spawn = _instance_spawn_frame(rec, cam_samples) or 0
+                try:
+                    apply_instance_tracks(target, ar, scale, inst_name, spawn)
+                    if spawn:
+                        new_obj["dfx_spawn_frame"] = spawn
+                        print(f"[DFX]     {inst_name}: track starts at intro frame "
+                              f"{spawn + 1} (camera within {rec.intro_dist} units)")
+                except Exception as e:
+                    print(f"[DFX]   WARNING: track animation failed for {inst_name}: {e}")
 
 
 def find_matching_vd3(dfx_path: str) -> Optional[str]:
@@ -2660,7 +3134,7 @@ def load_drm(context, filepath, vrm_path="", import_level=True,
                                 try:
                                     anims = parse_animations(data, obj_addr, bc)
                                     if anims:
-                                        apply_animations_to_armature(arm_obj, anims)
+                                        apply_animations_to_armature(arm_obj, anims, mdl.bones, scale)
                                 except Exception as ae:
                                     print(f"[PS1]   WARNING: Animation import "
                                           f"failed for '{mdl.name}': {ae}")
@@ -2940,7 +3414,7 @@ def load_dfx(context, filepath, vd3_path="", import_level=True,
                             if bc > 1 and import_animations:
                                 try:
                                     anims = parse_animations(data, obj_addr, bc)
-                                    if anims: apply_animations_to_armature(arm_obj, anims)
+                                    if anims: apply_animations_to_armature(arm_obj, anims, mdl.bones, scale)
                                 except Exception as ae:
                                     print(f"[DFX]   WARNING: Animation import failed for '{mdl.name}': {ae}")
                 except Exception as e:

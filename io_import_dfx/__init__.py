@@ -4,7 +4,7 @@
 bl_info = {
     "name": "Walt Disney World Quest DFX/DRM Importer",
     "author": "ravenDS",
-    "version": (2, 2, 0),
+    "version": (3, 1, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > DFX/DRM Level",
     "description": "Import level geometry and object models from Walt Disney World Quest: Magical Racing Tour DFX/VD3 (PC) and DRM/VRM (PS1) files",
@@ -31,6 +31,8 @@ class IMPORT_OT_dfx(bpy.types.Operator, ImportHelper):
     import_objects: BoolProperty(name="Import Object Models", default=True)
     import_textures: BoolProperty(name="Import Textures", default=True)
     import_overlays: BoolProperty(name="Import Overlay Surfaces", default=True)
+    import_animations: BoolProperty(name="Import Bone Animations", default=True,
+        description="Import skeletal animations as actions (first action active, others as muted NLA tracks)")
     scale: FloatProperty(name="Scale", default=0.01, min=0.0001, max=100.0)
 
     def execute(self, context):
@@ -38,7 +40,7 @@ class IMPORT_OT_dfx(bpy.types.Operator, ImportHelper):
         return dfx_import.load_dfx(context, filepath=self.filepath,
             vd3_path=self.vd3_path, import_level=self.import_level,
             import_objects=self.import_objects, import_textures=self.import_textures,
-            import_overlays=self.import_overlays, import_animations=False,
+            import_overlays=self.import_overlays, import_animations=self.import_animations,
             scale=self.scale)
 
     def draw(self, context):
@@ -49,6 +51,7 @@ class IMPORT_OT_dfx(bpy.types.Operator, ImportHelper):
         layout.prop(self, "import_objects")
         layout.prop(self, "import_textures")
         layout.prop(self, "import_overlays")
+        layout.prop(self, "import_animations")
         layout.prop(self, "scale")
 
 
@@ -67,6 +70,8 @@ class IMPORT_OT_drm(bpy.types.Operator, ImportHelper):
     import_objects: BoolProperty(name="Import Object Models", default=True)
     import_textures: BoolProperty(name="Import Textures", default=True)
     import_overlays: BoolProperty(name="Import Overlay Surfaces", default=True)
+    import_animations: BoolProperty(name="Import Bone Animations", default=True,
+        description="Import skeletal animations as actions (first action active, others as muted NLA tracks)")
     scale: FloatProperty(name="Scale", default=0.01, min=0.0001, max=100.0)
 
     def execute(self, context):
@@ -74,7 +79,7 @@ class IMPORT_OT_drm(bpy.types.Operator, ImportHelper):
         return dfx_import.load_drm(context, filepath=self.filepath,
             vrm_path=self.vrm_path, import_level=self.import_level,
             import_objects=self.import_objects, import_textures=self.import_textures,
-            import_overlays=self.import_overlays, import_animations=False,
+            import_overlays=self.import_overlays, import_animations=self.import_animations,
             scale=self.scale)
 
     def draw(self, context):
@@ -85,6 +90,7 @@ class IMPORT_OT_drm(bpy.types.Operator, ImportHelper):
         layout.prop(self, "import_objects")
         layout.prop(self, "import_textures")
         layout.prop(self, "import_overlays")
+        layout.prop(self, "import_animations")
         layout.prop(self, "scale")
 
 

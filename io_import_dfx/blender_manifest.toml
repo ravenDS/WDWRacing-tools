@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "io_import_dfx"
-version = "2.2.0"
+version = "3.1.0"
 name = "Walt Disney World Quest DFX/DRM Importer"
 tagline = "Import Walt Disney Magical Racing Tour DFX/DRM levels"
 maintainer = "ravenDS"
